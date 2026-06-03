@@ -19,7 +19,17 @@ function App() {
   const [selected, setSelected] = useState<Section | null>(null)
 
   const maxEnergy = useMemo(() => Math.max(...map.energy, 1), [map.energy])
+  const waveformBars = useMemo(() => map.energy.map((value, index) => ({
+    id: `wave-${index}`,
+    value: Math.max(0.08, value / maxEnergy),
+    isBeat: index % 4 === 0,
+  })), [map.energy, maxEnergy])
+  const barMarkers = useMemo(() => {
+    const step = map.bars > 128 ? 16 : 8
+    return Array.from({ length: Math.floor(map.bars / step) + 1 }, (_, index) => index * step + 1).filter((bar) => bar <= map.bars)
+  }, [map.bars])
   const activeSection = selected ?? map.sections.find((s) => s.type === 'drop') ?? map.sections[0]
+  const activeSectionCenter = ((activeSection.startBar + activeSection.endBar) / 2 / map.bars) * 100
 
   async function onSong(file: File | undefined) {
     if (!file) return
@@ -72,11 +82,60 @@ function App() {
         <div><span>Target separation</span><strong>4–6 stems</strong></div>
       </section>
 
+      <section className="audio-timeline-panel">
+        <div className="panel-heading">
+          <div>
+            <p className="eyebrow">Audio timeline</p>
+            <h2>Waveform with section blocks</h2>
+          </div>
+          <p>Blocks sit on top of the waveform so the song reads like a DAW arrangement view.</p>
+        </div>
+        <div className="audio-timeline" aria-label="Waveform timeline with section overlay">
+          <div className="timeline-ruler">
+            {barMarkers.map((bar) => (
+              <span key={bar} style={{ left: `${((bar - 1) / map.bars) * 100}%` }}>Bar {bar}</span>
+            ))}
+          </div>
+          <div className="section-overlay">
+            {map.sections.map((section) => (
+              <button
+                key={`overlay-${section.id}`}
+                className={`overlay-block ${sectionClass[section.type]} ${activeSection.id === section.id ? 'active' : ''}`}
+                style={{ flexGrow: section.endBar - section.startBar + 1 }}
+                onClick={() => setSelected(section)}
+              >
+                <strong>{section.label}</strong>
+                <span>{section.loop}</span>
+              </button>
+            ))}
+          </div>
+          <div className="waveform-track">
+            <div className="playhead" style={{ left: `${activeSectionCenter}%` }}>
+              <i />
+            </div>
+            <div className="waveform-zero" />
+            <div className="waveform-bars">
+              {waveformBars.map((bar) => (
+                <i
+                  key={bar.id}
+                  className={bar.isBeat ? 'beat' : undefined}
+                  style={{ height: `${18 + bar.value * 78}%` }}
+                />
+              ))}
+            </div>
+          </div>
+          <div className="timeline-footer">
+            <span>0:00</span>
+            <span>{Math.floor(map.duration / 60)}:{String(Math.round(map.duration % 60)).padStart(2, '0')}</span>
+          </div>
+        </div>
+      </section>
+
       <section className="timeline-panel">
         <div className="panel-heading">
           <div>
             <p className="eyebrow">Arrangement blocks</p>
-            <h2>Song timeline</h2>
+            <h2>Section cards</h2>
           </div>
           <p>Click a section to inspect loop identity and energy.</p>
         </div>
