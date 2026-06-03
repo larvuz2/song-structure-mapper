@@ -1,5 +1,6 @@
-import { useMemo, useState } from 'react'
+import { useEffect, useMemo, useRef, useState, type CSSProperties, type MouseEvent } from 'react'
 import './App.css'
+import { API_BASE, getTrackAudioUrl, getTrackMap, getTrackStatus, uploadTrack } from './api'
 import { analyzeAudioFile, applyUploadedStems, makeDemoMap, type Section, type SongMap } from './analysis'
 
 const sectionClass: Record<Section['type'], string> = {
@@ -12,11 +13,34 @@ const sectionClass: Record<Section['type'], string> = {
   variation: 'variation',
 }
 
+type AnalysisProgress = {
+  progress: number
+  message: string
+  stage: string
+  state: 'idle' | 'uploading' | 'queued' | 'analyzing' | 'ready' | 'error' | 'fallback'
+}
+
 function App() {
   const [map, setMap] = useState<SongMap>(() => makeDemoMap())
   const [trackName, setTrackName] = useState('Demo electronic reference map')
-  const [status, setStatus] = useState('Drop a full track to analyze, or add 4+ stems when separated.')
+  const [status, setStatus] = useState('Drop a full track to analyze on the VPS backend, then play it against the structure map.')
+  const [progress, setProgress] = useState<AnalysisProgress>({
+    progress: 0,
+    message: 'Backend target: Option A VPS mode.',
+    stage: 'idle',
+    state: 'idle',
+  })
   const [selected, setSelected] = useState<Section | null>(null)
+  const [audioSrc, setAudioSrc] = useState<string | null>(null)
+  const [isPlaying, setIsPlaying] = useState(false)
+  const [currentTime, setCurrentTime] = useState(0)
+  const [audioDuration, setAudioDuration] = useState(map.duration)
+  const audioRef = useRef<HTMLAudioElement | null>(null)
+  const localObjectUrl = useRef<string | null>(null)
+
+  useEffect(() => () => {
+    if (localObjectUrl.current) URL.revokeObjectURL(localObjectUrl.current)
+  }, [])
 
   const maxEnergy = useMemo(() => Math.max(...map.energy, 1), [map.energy])
   const waveformBars = useMemo(() => map.energy.map((value, index) => ({
@@ -28,37 +52,135 @@ function App() {
     const step = map.bars > 128 ? 16 : 8
     return Array.from({ length: Math.floor(map.bars / step) + 1 }, (_, index) => index * step + 1).filter((bar) => bar <= map.bars)
   }, [map.bars])
-  const activeSection = selected ?? map.sections.find((s) => s.type === 'drop') ?? map.sections[0]
-  const activeSectionCenter = ((activeSection.startBar + activeSection.endBar) / 2 / map.bars) * 100
+
+  const playbackRatio = audioDuration ? currentTime / audioDuration : 0
+  const currentBar = Math.max(1, Math.min(map.bars, Math.floor(playbackRatio * map.bars) + 1))
+  const playbackSection = map.sections.find((section) => currentBar >= section.startBar && currentBar <= section.endBar)
+  const activeSection = (isPlaying || currentTime > 0 ? playbackSection : null) ?? selected ?? map.sections[0]
+  const playheadLeft = audioSrc ? playbackRatio * 100 : ((activeSection.startBar + activeSection.endBar) / 2 / map.bars) * 100
 
   async function onSong(file: File | undefined) {
     if (!file) return
     setTrackName(file.name)
-    setStatus('Analyzing waveform, energy blocks, BPM estimate, and repeated loop families…')
+    setSelected(null)
+    setCurrentTime(0)
+    setIsPlaying(false)
+    setStatus('Uploading to VPS backend…')
+    setProgress({ progress: 2, message: 'Uploading file to the analysis backend.', stage: 'upload', state: 'uploading' })
+
+    if (localObjectUrl.current) URL.revokeObjectURL(localObjectUrl.current)
+    localObjectUrl.current = URL.createObjectURL(file)
+    setAudioSrc(localObjectUrl.current)
+
     try {
-      const next = await analyzeAudioFile(file)
-      setMap(next)
-      setSelected(next.sections[0])
-      setStatus('Analysis ready. For real 4/6-stem separation, run the Demucs backend command in docs/MVP_PLAN.md.')
+      const { trackId } = await uploadTrack(file)
+      setStatus(`Track uploaded. Job ${trackId} is analyzing.`)
+      await pollAnalysis(trackId)
     } catch (error) {
-      setStatus(`Could not decode this file in-browser. Try WAV/MP3. ${error instanceof Error ? error.message : ''}`)
+      setProgress({
+        progress: 12,
+        message: `VPS backend unavailable at ${API_BASE}. Running browser fallback so the interface still works locally.`,
+        stage: 'fallback',
+        state: 'fallback',
+      })
+      setStatus(`Backend unavailable; using browser fallback. ${error instanceof Error ? error.message : ''}`)
+      try {
+        const next = await analyzeAudioFile(file)
+        setMap(next)
+        setSelected(next.sections[0])
+        setAudioDuration(next.duration)
+        setProgress({ progress: 100, message: 'Fallback analysis ready. Press play.', stage: 'ready', state: 'ready' })
+        setStatus('Fallback analysis ready. For full VPS mode, run the backend server and set VITE_API_BASE_URL.')
+      } catch (fallbackError) {
+        setProgress({ progress: 100, message: 'Could not analyze this file.', stage: 'error', state: 'error' })
+        setStatus(`Could not decode this file. Try WAV/MP3. ${fallbackError instanceof Error ? fallbackError.message : ''}`)
+      }
     }
+  }
+
+  async function pollAnalysis(trackId: string) {
+    for (let attempt = 0; attempt < 240; attempt++) {
+      const nextStatus = await getTrackStatus(trackId)
+      setProgress({
+        progress: nextStatus.progress,
+        message: nextStatus.message,
+        stage: nextStatus.stage,
+        state: nextStatus.state,
+      })
+      setStatus(nextStatus.message)
+
+      if (nextStatus.state === 'ready') {
+        const nextMap = await getTrackMap(trackId)
+        setMap(nextMap)
+        setSelected(nextMap.sections[0])
+        setAudioDuration(nextMap.duration)
+        setAudioSrc(getTrackAudioUrl(trackId))
+        setStatus('Analysis ready. Press play and watch the structure move.')
+        return
+      }
+
+      if (nextStatus.state === 'error') throw new Error(nextStatus.message)
+      await new Promise((resolve) => window.setTimeout(resolve, 900))
+    }
+    throw new Error('Analysis timed out. The backend job is taking too long.')
   }
 
   function onStems(files: FileList | null) {
     const list = Array.from(files ?? [])
     if (!list.length) return
     setMap((current) => applyUploadedStems(current, list))
-    setStatus(`${list.length} stem lanes loaded. MVP visual supports 4+ stems; default target is 6: drums, bass, vocals, other, guitar, piano.`)
+    setStatus(`${list.length} stem lanes loaded. MVP visual supports 4+ stems; Demucs 4/6-stem backend separation is the next server step.`)
+  }
+
+  async function togglePlayback() {
+    const audio = audioRef.current
+    if (!audio || !audioSrc) return
+    if (audio.paused) {
+      await audio.play()
+      setIsPlaying(true)
+    } else {
+      audio.pause()
+      setIsPlaying(false)
+    }
+  }
+
+  function seekToRatio(ratio: number) {
+    const audio = audioRef.current
+    if (!audio || !audioDuration) return
+    const nextTime = Math.max(0, Math.min(audioDuration, ratio * audioDuration))
+    audio.currentTime = nextTime
+    setCurrentTime(nextTime)
+  }
+
+  function selectSection(section: Section) {
+    setSelected(section)
+    if (audioSrc) {
+      seekToRatio((section.startBar - 1) / map.bars)
+    }
+  }
+
+  function onTimelineClick(event: MouseEvent<HTMLDivElement>) {
+    const rect = event.currentTarget.getBoundingClientRect()
+    seekToRatio((event.clientX - rect.left) / rect.width)
   }
 
   return (
     <main className="app-shell">
+      <audio
+        ref={audioRef}
+        src={audioSrc ?? undefined}
+        onLoadedMetadata={(event) => setAudioDuration(event.currentTarget.duration || map.duration)}
+        onTimeUpdate={(event) => setCurrentTime(event.currentTarget.currentTime)}
+        onPause={() => setIsPlaying(false)}
+        onPlay={() => setIsPlaying(true)}
+        onEnded={() => setIsPlaying(false)}
+      />
+
       <section className="hero">
         <div>
           <p className="eyebrow">SONG STRUCTURE MAPPER MVP</p>
           <h1>Dark pastel x-ray for electronic tracks.</h1>
-          <p className="subcopy">Split the track into readable musical blocks: intro, groove, builds, drops, breakdowns, stem activity, repeated loop families, and energy movement.</p>
+          <p className="subcopy">Upload one track, wait while the backend explains every analysis step, then play/pause and watch the arrangement map follow the song.</p>
         </div>
         <div className="upload-card">
           <label className="upload-button">
@@ -69,8 +191,19 @@ function App() {
             <input type="file" accept="audio/*" multiple onChange={(event) => onStems(event.target.files)} />
             Add separated stems
           </label>
-          <button className="ghost-button" onClick={() => { setMap(makeDemoMap()); setTrackName('Demo electronic reference map'); setStatus('Demo map restored.'); }}>Reset demo</button>
+          <button className="ghost-button" onClick={() => { const demo = makeDemoMap(); setMap(demo); setTrackName('Demo electronic reference map'); setStatus('Demo map restored.'); setProgress({ progress: 0, message: 'Backend target: Option A VPS mode.', stage: 'idle', state: 'idle' }); setAudioSrc(null); setCurrentTime(0); setAudioDuration(demo.duration); }}>Reset demo</button>
           <p>{status}</p>
+        </div>
+      </section>
+
+      <section className="progress-panel">
+        <div className="progress-copy">
+          <p className="eyebrow">Analysis communication</p>
+          <h2>{progress.message}</h2>
+          <span>{progress.stage} · {progress.state}</span>
+        </div>
+        <div className="progress-meter" aria-label="Analysis progress">
+          <i style={{ width: `${progress.progress}%` }} />
         </div>
       </section>
 
@@ -78,8 +211,17 @@ function App() {
         <div><span>Track</span><strong>{trackName}</strong></div>
         <div><span>BPM</span><strong>{map.bpm}</strong></div>
         <div><span>Bars</span><strong>{map.bars}</strong></div>
-        <div><span>Stems</span><strong>{map.stems.length}</strong></div>
-        <div><span>Target separation</span><strong>4–6 stems</strong></div>
+        <div><span>Time</span><strong>{formatTime(currentTime)} / {formatTime(audioDuration || map.duration)}</strong></div>
+        <div><span>Backend</span><strong>{API_BASE}</strong></div>
+      </section>
+
+      <section className="transport-panel">
+        <button className="play-button" disabled={!audioSrc} onClick={() => void togglePlayback()}>{isPlaying ? 'Pause' : 'Play'}</button>
+        <div>
+          <p className="eyebrow">Now reading</p>
+          <h2>{activeSection.label} · {activeSection.loop}</h2>
+          <span>Bar {currentBar} / {map.bars}</span>
+        </div>
       </section>
 
       <section className="audio-timeline-panel">
@@ -88,7 +230,7 @@ function App() {
             <p className="eyebrow">Audio timeline</p>
             <h2>Waveform with section blocks</h2>
           </div>
-          <p>Blocks sit on top of the waveform so the song reads like a DAW arrangement view.</p>
+          <p>Click the waveform or any block to seek. The playhead is synced to the real audio element.</p>
         </div>
         <div className="audio-timeline" aria-label="Waveform timeline with section overlay">
           <div className="timeline-ruler">
@@ -102,15 +244,15 @@ function App() {
                 key={`overlay-${section.id}`}
                 className={`overlay-block ${sectionClass[section.type]} ${activeSection.id === section.id ? 'active' : ''}`}
                 style={{ flexGrow: section.endBar - section.startBar + 1 }}
-                onClick={() => setSelected(section)}
+                onClick={() => selectSection(section)}
               >
                 <strong>{section.label}</strong>
                 <span>{section.loop}</span>
               </button>
             ))}
           </div>
-          <div className="waveform-track">
-            <div className="playhead" style={{ left: `${activeSectionCenter}%` }}>
+          <div className="waveform-track" onClick={onTimelineClick}>
+            <div className="playhead" style={{ left: `${playheadLeft}%` }}>
               <i />
             </div>
             <div className="waveform-zero" />
@@ -125,8 +267,8 @@ function App() {
             </div>
           </div>
           <div className="timeline-footer">
-            <span>0:00</span>
-            <span>{Math.floor(map.duration / 60)}:{String(Math.round(map.duration % 60)).padStart(2, '0')}</span>
+            <span>{formatTime(currentTime)}</span>
+            <span>{formatTime(audioDuration || map.duration)}</span>
           </div>
         </div>
       </section>
@@ -137,7 +279,7 @@ function App() {
             <p className="eyebrow">Arrangement blocks</p>
             <h2>Section cards</h2>
           </div>
-          <p>Click a section to inspect loop identity and energy.</p>
+          <p>Click a section to inspect loop identity and jump playback.</p>
         </div>
         <div className="timeline">
           {map.sections.map((section) => (
@@ -145,7 +287,7 @@ function App() {
               key={section.id}
               className={`section-block ${sectionClass[section.type]} ${activeSection.id === section.id ? 'active' : ''}`}
               style={{ flexGrow: section.endBar - section.startBar + 1 }}
-              onClick={() => setSelected(section)}
+              onClick={() => selectSection(section)}
             >
               <span>{section.label}</span>
               <strong>{section.loop}</strong>
@@ -167,7 +309,7 @@ function App() {
           <div className="stem-map">
             {map.stems.map((stem) => (
               <div className="stem-row" key={stem.id}>
-                <div className="stem-label" style={{ '--stem': stem.color } as React.CSSProperties}>
+                <div className="stem-label" style={{ '--stem': stem.color } as CSSProperties}>
                   <i />
                   <span>{stem.name}</span>
                 </div>
@@ -181,7 +323,7 @@ function App() {
                         flexGrow: section.endBar - section.startBar + 1,
                         '--stem': stem.color,
                         '--activity': stem.activity[index] / 100,
-                      } as React.CSSProperties}
+                      } as CSSProperties}
                     >
                       <span>{stem.loops[index]}</span>
                     </div>
@@ -236,6 +378,13 @@ function App() {
       </section>
     </main>
   )
+}
+
+function formatTime(seconds: number): string {
+  if (!Number.isFinite(seconds)) return '0:00'
+  const minutes = Math.floor(seconds / 60)
+  const remaining = Math.floor(seconds % 60)
+  return `${minutes}:${String(remaining).padStart(2, '0')}`
 }
 
 export default App

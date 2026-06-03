@@ -8,6 +8,9 @@ pnpm-debug.log*
 lerna-debug.log*
 
 node_modules
+backend/.venv
+backend/storage
+storage
 dist
 dist-ssr
 *.local
@@ -22,3 +25,8 @@ dist-ssr
 *.njsproj
 *.sln
 *.sw?
+
+# Python cache
+__pycache__/
+*.py[cod]
+.pytest_cache/
